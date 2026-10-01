@@ -72,4 +72,6 @@ pub enum PredictXError {
     ContractPaused = 33,
     /// Stake amount is below the minimum required.
     StakeBelowMinimum = 34,
+    /// An arithmetic operation in a contract calculation overflowed or was undefined.
+    ArithmeticOverflow = 35,
 }

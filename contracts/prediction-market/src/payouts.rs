@@ -40,9 +40,14 @@ pub fn resolve_poll(
         .persistent()
         .set(&DataKey::Poll(poll_id), &poll);
 
-    let total_pool = poll.yes_pool + poll.no_pool;
-    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128
-        / BPS_DENOMINATOR as i128;
+    let total_pool = poll
+        .yes_pool
+        .checked_add(poll.no_pool)
+        .ok_or(PredictXError::ArithmeticOverflow)?;
+    let fee = total_pool
+        .checked_mul(token_utils::get_platform_fee_bps(env) as i128)
+        .and_then(|value| value.checked_div(BPS_DENOMINATOR as i128))
+        .ok_or(PredictXError::ArithmeticOverflow)?;
 
     env.events().publish(
         (Symbol::new(env, "PollResolved"), poll_id),
@@ -137,33 +142,51 @@ fn calculate_winnings_for(
     }
 
     let winning_pool = if outcome { poll.yes_pool } else { poll.no_pool };
-    if winning_pool <= 0 {
+    if winning_pool < 0 {
         return Ok(0);
     }
 
-    let total_pool = poll.yes_pool + poll.no_pool;
-    let payout_pool = total_pool * (BPS_DENOMINATOR - fee_bps) as i128
-        / BPS_DENOMINATOR as i128;
+    let total_pool = poll
+        .yes_pool
+        .checked_add(poll.no_pool)
+        .ok_or(PredictXError::ArithmeticOverflow)?;
+    let fee_factor = BPS_DENOMINATOR
+        .checked_sub(fee_bps)
+        .ok_or(PredictXError::ArithmeticOverflow)?;
+    let payout_pool = total_pool
+        .checked_mul(fee_factor as i128)
+        .and_then(|value| value.checked_div(BPS_DENOMINATOR as i128))
+        .ok_or(PredictXError::ArithmeticOverflow)?;
 
-    Ok(stake.amount * payout_pool / winning_pool)
+    let winnings_numerator = stake
+        .amount
+        .checked_mul(payout_pool)
+        .ok_or(PredictXError::ArithmeticOverflow)?;
+    let winnings = winnings_numerator
+        .checked_div(winning_pool)
+        .ok_or(PredictXError::ArithmeticOverflow)?;
+
+    Ok(winnings)
 }
 
 #[cfg(test)]
 mod test {
     extern crate std;
 
-    use predictx_shared::{PollCategory, PredictXError, StakeSide};
+    use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide};
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger},
         token, Address, Env, String, Symbol, TryIntoVal,
     };
 
+    use super::calculate_winnings_for;
     use crate::{PredictionMarket, PredictionMarketClient};
 
     struct TestSetup<'a> {
         env: Env,
         admin: Address,
         token_addr: Address,
+        contract_id: Address,
         client: PredictionMarketClient<'a>,
     }
 
@@ -186,7 +209,7 @@ mod test {
         client.initialize(&admin, &oracle_id, &token_addr, &treasury, &500_u32);
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
-        TestSetup { env, admin, token_addr, client }
+        TestSetup { env, admin, token_addr, contract_id, client }
     }
 
     fn create_poll(s: &TestSetup, lock_time: u64) -> u64 {
@@ -205,6 +228,25 @@ mod test {
             &PollCategory::PlayerEvent,
             &lock_time,
         )
+    }
+
+    fn load_poll(s: &TestSetup, poll_id: u64) -> Poll {
+        s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .get(&crate::DataKey::Poll(poll_id))
+                .unwrap()
+        })
+    }
+
+    fn store_poll(s: &TestSetup, poll: &Poll) {
+        s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .set(&crate::DataKey::Poll(poll.poll_id), poll);
+        });
     }
 
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
@@ -292,5 +334,82 @@ mod test {
             let name: Symbol = topics.get(0).unwrap().try_into_val(&s.env).unwrap();
             assert_ne!(name, Symbol::new(&s.env, "WinningsClaimed"));
         }
+    }
+
+    #[test]
+    fn resolve_poll_returns_arithmetic_overflow_for_max_pool_fee() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let mut poll = load_poll(&s, poll_id);
+        poll.yes_pool = i128::MAX;
+        store_poll(&s, &poll);
+
+        let err = s
+            .client
+            .try_resolve_poll(&s.admin, &poll_id, &true)
+            .expect_err("maximum pool fee calculation should fail")
+            .unwrap();
+
+        assert_eq!(err, PredictXError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn winnings_multiplication_overflows_return_arithmetic_overflow() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let mut poll = load_poll(&s, poll_id);
+        poll.yes_pool = i128::MAX;
+        poll.no_pool = 0;
+        poll.status = PollStatus::Resolved;
+        poll.outcome = Some(true);
+        let stake = Stake {
+            user: Address::generate(&s.env),
+            poll_id,
+            amount: 1,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: 0,
+        };
+
+        assert_eq!(
+            calculate_winnings_for(&poll, &stake, 500),
+            Err(PredictXError::ArithmeticOverflow)
+        );
+
+        let large_pool = i128::MAX / 10_000;
+        poll.yes_pool = large_pool;
+        let large_stake = Stake {
+            amount: large_pool,
+            ..stake
+        };
+
+        assert_eq!(
+            calculate_winnings_for(&poll, &large_stake, 500),
+            Err(PredictXError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn winnings_returns_arithmetic_overflow_for_zero_winning_pool() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let mut poll = load_poll(&s, poll_id);
+        poll.yes_pool = 0;
+        poll.no_pool = 100;
+        poll.status = PollStatus::Resolved;
+        poll.outcome = Some(true);
+        let stake = Stake {
+            user: Address::generate(&s.env),
+            poll_id,
+            amount: 1,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: 0,
+        };
+
+        assert_eq!(
+            calculate_winnings_for(&poll, &stake, 500),
+            Err(PredictXError::ArithmeticOverflow)
+        );
     }
 }
